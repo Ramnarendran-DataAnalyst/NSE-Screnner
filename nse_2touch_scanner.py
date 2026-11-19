@@ -25,6 +25,17 @@ HEADERS = {
 }
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s", datefmt="%H:%M:%S")
 
+BHAVCOPY_ALIASES = {
+    "DATE": ("TRADEDATE", "TRADDT", "BIZDT", "TIMESTAMP", "DATE"),
+    "SYMBOL": ("TCKRSYMB", "SYMBOL"),
+    "SERIES": ("SCTYSRS", "SERIES"),
+    "OPEN": ("OPNPRIC", "OPNPRICE", "OPENPRICE", "OPENINGPRICE", "OPEN"),
+    "HIGH": ("HGHPRIC", "HIGHPRICE", "HIGHESTPRICE", "HIGH"),
+    "LOW": ("LWPRIC", "LOWPRICE", "LOWESTPRICE", "LOW"),
+    "CLOSE": ("CLSPRIC", "CLSPRICE", "CLOSEPRICE", "CLOSINGPRICE", "CLOSE"),
+    "VOLUME": ("TTLTRADGVOL", "TTLTRDQTY", "TOTTRDQTY", "TOTALTRADEDQTY", "TOTALTRADEDQUANTITY", "TOTALTRADEDVOLUME", "TRADEDVOLUME", "VOLUME"),
+}
+
 
 def get_session():
     s = requests.Session(); s.headers.update(HEADERS)
@@ -44,30 +55,28 @@ def read_bhavcopy(content: bytes, filename: str = "upload.csv") -> pd.DataFrame:
             names = [n for n in archive.namelist() if n.lower().endswith(".csv")]
             if not names:
                 raise ValueError("ZIP contains no CSV file")
-            with archive.open(names[0]) as csv_file:
-                df = pd.read_csv(csv_file)
+            candidates = []
+            known = {alias for choices in BHAVCOPY_ALIASES.values() for alias in choices}
+            for name in names:
+                table = pd.read_csv(io.BytesIO(archive.read(name)))
+                normalized = {re.sub(r"[^A-Z0-9]", "", str(c).strip().upper()) for c in table.columns}
+                candidates.append((len(normalized & known), table))
+            df = max(candidates, key=lambda item: item[0])[1]
     else:
         df = pd.read_csv(stream)
 
     # Normalize labels first, then pick one source column per output field. This
     # avoids duplicate-key errors when a file contains multiple date aliases.
     columns = [(str(c), re.sub(r"[^A-Z0-9]", "", str(c).strip().upper())) for c in df.columns]
-    aliases = {
-        "DATE": ("TRADEDATE", "TRADDT", "BIZDT", "TIMESTAMP", "DATE"),
-        "SYMBOL": ("TCKRSYMB", "SYMBOL"),
-        "SERIES": ("SCTYSRS", "SERIES"),
-        "OPEN": ("OPNPRIC", "OPEN"), "HIGH": ("HGHPRIC", "HIGH"),
-        "LOW": ("LWPRIC", "LOW"), "CLOSE": ("CLSPRIC", "CLOSE"),
-        "VOLUME": ("TTLTRADGVOL", "TTLTRDQTY", "TOTTRDQTY", "VOLUME"),
-    }
     selected = {}
-    for target, choices in aliases.items():
+    for target, choices in BHAVCOPY_ALIASES.items():
         source = next((original for choice in choices for original, normalized in columns if normalized == choice), None)
         if source is not None:
             selected[target] = df[source].reset_index(drop=True)
     missing = [c for c in ("SYMBOL", "SERIES", "OPEN", "HIGH", "LOW", "CLOSE", "VOLUME") if c not in selected]
     if missing:
-        raise ValueError(f"Missing columns {missing}. Include symbol, series, date, open, high, low, close and volume.")
+        found = [str(c) for c in df.columns]
+        raise ValueError(f"Missing columns {missing}. Headers found: {found}. Upload NSE CM-UDiFF Common Bhavcopy Final, or a file with symbol, series, date, open, high, low, close and volume columns.")
 
     if "DATE" in selected:
         dates = pd.to_datetime(selected["DATE"], errors="coerce", dayfirst=True)
