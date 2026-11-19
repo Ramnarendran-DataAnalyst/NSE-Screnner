@@ -5,7 +5,7 @@ Downloads NSE CM UDiFF daily final bhavcopies, caches them locally, builds OHLCV
 history, and scans EQ-series cash stocks. Signals use completed daily candles only.
 """
 from __future__ import annotations
-import argparse, io, logging, time, zipfile
+import argparse, io, logging, re, time, zipfile
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Optional
@@ -33,40 +33,84 @@ def get_session():
     return s
 
 
-def read_bhavcopy(content: bytes) -> pd.DataFrame:
-    with zipfile.ZipFile(io.BytesIO(content)) as z:
-        names = [n for n in z.namelist() if n.lower().endswith('.csv')]
-        if not names: raise ValueError("No CSV found inside bhavcopy ZIP")
-        df = pd.read_csv(z.open(names[0]))
-    df.columns = [str(c).strip().upper() for c in df.columns]
-    # Current UDiFF CM common bhavcopy field names.
-    aliases = {
-        "TRADE_DATE": "TRADE_DATE", "TRADDT": "TRADE_DATE", "TRAD_DT": "TRADE_DATE", "BIZDT": "TRADE_DATE",
-        "TCKRSYMB": "SYMBOL", "TCKR_SYMB": "SYMBOL", "SYMBOL": "SYMBOL",
-        "SCTYSRS": "SERIES", "SCTY_SRS": "SERIES", "SERIES": "SERIES",
-        "OPNPRIC": "OPEN", "OPN_PRIC": "OPEN", "OPEN": "OPEN",
-        "HGHPRIC": "HIGH", "HGH_PRIC": "HIGH", "HIGH": "HIGH",
-        "LWPRIC": "LOW", "LW_PRIC": "LOW", "LOW": "LOW",
-        "CLSPRIC": "CLOSE", "CLS_PRIC": "CLOSE", "CLOSE": "CLOSE",
-        "TTLTRDQTY": "VOLUME", "TTL_TRD_QNTY": "VOLUME", "TOTTRDQTY": "VOLUME",
-        # Current NSE UDiFF CM files use TtlTradgVol (not TtlTrdQty).
-        "TTLTRADGVOL": "VOLUME", "TTL_TRADG_VOL": "VOLUME", "VOLUME": "VOLUME"
-    }
-    df = df.rename(columns={c: aliases[c] for c in df.columns if c in aliases})
-    required = ["SYMBOL", "SERIES", "OPEN", "HIGH", "LOW", "CLOSE", "VOLUME"]
-    missing = [c for c in required if c not in df.columns]
-    if missing: raise ValueError(f"Bhavcopy schema changed; missing {missing}. Found: {list(df.columns)}")
-    if "TRADE_DATE" in df.columns:
-        df["DATE"] = pd.to_datetime(df["TRADE_DATE"], errors="coerce", dayfirst=True)
+def read_bhavcopy(content: bytes, filename: str = "upload.csv") -> pd.DataFrame:
+    """Read one NSE bhavcopy CSV/ZIP or an Excel file into unique canonical columns."""
+    stream = io.BytesIO(content)
+    if filename.lower().endswith((".xlsx", ".xls")):
+        df = pd.read_excel(stream)
+    elif zipfile.is_zipfile(stream):
+        stream.seek(0)
+        with zipfile.ZipFile(stream) as archive:
+            names = [n for n in archive.namelist() if n.lower().endswith(".csv")]
+            if not names:
+                raise ValueError("ZIP contains no CSV file")
+            with archive.open(names[0]) as csv_file:
+                df = pd.read_csv(csv_file)
     else:
-        # Date is encoded in the official filename, added by downloader.
-        df["DATE"] = pd.NaT
-    for c in ["OPEN", "HIGH", "LOW", "CLOSE", "VOLUME"]:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
-    df["SYMBOL"] = df["SYMBOL"].astype(str).str.strip()
-    df["SERIES"] = df["SERIES"].astype(str).str.strip().str.upper()
-    df = df[(df["SERIES"] == "EQ") & df["SYMBOL"].ne("")]
-    return df[["DATE", "SYMBOL", "OPEN", "HIGH", "LOW", "CLOSE", "VOLUME"]].dropna(subset=["OPEN", "HIGH", "LOW", "CLOSE"])
+        df = pd.read_csv(stream)
+
+    # Normalize labels first, then pick one source column per output field. This
+    # avoids duplicate-key errors when a file contains multiple date aliases.
+    columns = [(str(c), re.sub(r"[^A-Z0-9]", "", str(c).strip().upper())) for c in df.columns]
+    aliases = {
+        "DATE": ("TRADEDATE", "TRADDT", "BIZDT", "TIMESTAMP", "DATE"),
+        "SYMBOL": ("TCKRSYMB", "SYMBOL"),
+        "SERIES": ("SCTYSRS", "SERIES"),
+        "OPEN": ("OPNPRIC", "OPEN"), "HIGH": ("HGHPRIC", "HIGH"),
+        "LOW": ("LWPRIC", "LOW"), "CLOSE": ("CLSPRIC", "CLOSE"),
+        "VOLUME": ("TTLTRADGVOL", "TTLTRDQTY", "TOTTRDQTY", "VOLUME"),
+    }
+    selected = {}
+    for target, choices in aliases.items():
+        source = next((original for choice in choices for original, normalized in columns if normalized == choice), None)
+        if source is not None:
+            selected[target] = df[source].reset_index(drop=True)
+    missing = [c for c in ("SYMBOL", "SERIES", "OPEN", "HIGH", "LOW", "CLOSE", "VOLUME") if c not in selected]
+    if missing:
+        raise ValueError(f"Missing columns {missing}. Include symbol, series, date, open, high, low, close and volume.")
+
+    if "DATE" in selected:
+        dates = pd.to_datetime(selected["DATE"], errors="coerce", dayfirst=True)
+    else:
+        dates = pd.Series(pd.NaT, index=range(len(df)))
+    match = re.search(r"(20\d{6})", filename)
+    if match:
+        dates = dates.fillna(pd.to_datetime(match.group(1), format="%Y%m%d"))
+    out = pd.DataFrame({"DATE": dates, **{key: selected[key] for key in ("SYMBOL", "SERIES", "OPEN", "HIGH", "LOW", "CLOSE", "VOLUME")}})
+    for c in ("OPEN", "HIGH", "LOW", "CLOSE", "VOLUME"):
+        out[c] = pd.to_numeric(out[c], errors="coerce")
+    out["SYMBOL"] = out["SYMBOL"].astype(str).str.strip().str.upper()
+    out["SERIES"] = out["SERIES"].astype(str).str.strip().str.upper()
+    out = out[(out["SERIES"] == "EQ") & out["SYMBOL"].ne("")]
+    return out[["DATE", "SYMBOL", "OPEN", "HIGH", "LOW", "CLOSE", "VOLUME"]].dropna(subset=["DATE", "OPEN", "HIGH", "LOW", "CLOSE"])
+
+
+def read_uploaded_history(content: bytes, filename: str) -> pd.DataFrame:
+    """Read a bhavcopy or an archive containing many daily CSV/ZIP files."""
+    if not filename.lower().endswith(".zip"):
+        return read_bhavcopy(content, filename)
+
+    def unpack(payload: bytes, member_name: str, depth: int = 0) -> list[pd.DataFrame]:
+        if depth > 4:
+            raise ValueError("ZIP nesting is deeper than supported (maximum 4 levels)")
+        with zipfile.ZipFile(io.BytesIO(payload)) as archive:
+            frames = []
+            for info in archive.infolist():
+                if info.is_dir():
+                    continue
+                name = info.filename
+                lower = name.lower()
+                if lower.endswith(".csv"):
+                    frames.append(read_bhavcopy(archive.read(info), name))
+                elif lower.endswith(".zip"):
+                    frames.extend(unpack(archive.read(info), name, depth + 1))
+            return frames
+
+    frames = unpack(content, filename)
+    if not frames:
+        # Also accept a single NSE bhavcopy ZIP whose inner CSV has an unusual suffix.
+        return read_bhavcopy(content, filename)
+    return pd.concat(frames, ignore_index=True)
 
 
 def download_history(months: int, pause: float = 0.25) -> pd.DataFrame:
