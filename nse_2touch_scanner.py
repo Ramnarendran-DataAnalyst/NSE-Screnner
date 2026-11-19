@@ -41,14 +41,16 @@ def read_bhavcopy(content: bytes) -> pd.DataFrame:
     df.columns = [str(c).strip().upper() for c in df.columns]
     # Current UDiFF CM common bhavcopy field names.
     aliases = {
-        "TRADE_DATE": "TRADE_DATE", "TRADDT": "TRADE_DATE", "TRAD_DT": "TRADE_DATE",
+        "TRADE_DATE": "TRADE_DATE", "TRADDT": "TRADE_DATE", "TRAD_DT": "TRADE_DATE", "BIZDT": "TRADE_DATE",
         "TCKRSYMB": "SYMBOL", "TCKR_SYMB": "SYMBOL", "SYMBOL": "SYMBOL",
         "SCTYSRS": "SERIES", "SCTY_SRS": "SERIES", "SERIES": "SERIES",
         "OPNPRIC": "OPEN", "OPN_PRIC": "OPEN", "OPEN": "OPEN",
         "HGHPRIC": "HIGH", "HGH_PRIC": "HIGH", "HIGH": "HIGH",
         "LWPRIC": "LOW", "LW_PRIC": "LOW", "LOW": "LOW",
         "CLSPRIC": "CLOSE", "CLS_PRIC": "CLOSE", "CLOSE": "CLOSE",
-        "TTLTRDQTY": "VOLUME", "TTL_TRD_QNTY": "VOLUME", "TOTTRDQTY": "VOLUME", "VOLUME": "VOLUME"
+        "TTLTRDQTY": "VOLUME", "TTL_TRD_QNTY": "VOLUME", "TOTTRDQTY": "VOLUME",
+        # Current NSE UDiFF CM files use TtlTradgVol (not TtlTrdQty).
+        "TTLTRADGVOL": "VOLUME", "TTL_TRADG_VOL": "VOLUME", "VOLUME": "VOLUME"
     }
     df = df.rename(columns={c: aliases[c] for c in df.columns if c in aliases})
     required = ["SYMBOL", "SERIES", "OPEN", "HIGH", "LOW", "CLOSE", "VOLUME"]
@@ -75,6 +77,8 @@ def download_history(months: int, pause: float = 0.25) -> pd.DataFrame:
     frames = []
     day = start
     tried = 0; downloaded = 0
+    status_counts = {}
+    parse_errors = []
     while day <= end:
         if day.weekday() < 5:
             ymd = day.strftime("%Y%m%d")
@@ -86,6 +90,7 @@ def download_history(months: int, pause: float = 0.25) -> pd.DataFrame:
                 url = URL.format(ymd=ymd)
                 try:
                     r = session.get(url, timeout=25); tried += 1
+                    status_counts[r.status_code] = status_counts.get(r.status_code, 0) + 1
                     if r.status_code == 200 and r.content[:2] == b"PK":
                         path.write_bytes(r.content); content = r.content; downloaded += 1
                     elif r.status_code not in (404, 403):
@@ -100,9 +105,14 @@ def download_history(months: int, pause: float = 0.25) -> pd.DataFrame:
                     else: d["DATE"] = d["DATE"].fillna(pd.Timestamp(day))
                     frames.append(d)
                 except Exception as e:
+                    parse_errors.append(f"{ymd}: {e}")
                     logging.warning("Could not parse %s: %s", ymd, e)
         day += timedelta(days=1)
-    if not frames: raise RuntimeError("No NSE bhavcopy files downloaded/read. NSE may be blocking automated downloads; try again later or check internet access.")
+    if not frames:
+        details = f"Tried {tried} archive requests; HTTP statuses: {status_counts or 'none (network/cache issue)'}; ZIPs downloaded: {downloaded}."
+        if parse_errors:
+            details += " First parser errors: " + " | ".join(parse_errors[:3])
+        raise RuntimeError("No usable NSE bhavcopy files were loaded. " + details + " Check Streamlit logs. NSE's current UDiFF volume field is TtlTradgVol; this version supports it. If all requests are 403/429, NSE is blocking the cloud server IP.")
     data = pd.concat(frames, ignore_index=True).drop_duplicates(["DATE", "SYMBOL"], keep="last")
     data = data.sort_values(["SYMBOL", "DATE"])
     logging.info("Loaded %s rows across %s sessions (%s newly downloaded)", len(data), data.DATE.nunique(), downloaded)
