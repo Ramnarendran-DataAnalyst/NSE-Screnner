@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import pandas as pd
 import streamlit as st
 
-from nse_2touch_scanner import download_history, evaluate_symbol, save_excel
+from nse_2touch_scanner import download_history, evaluate_symbol, read_uploaded_history, save_excel
 
 st.set_page_config(page_title="NSE 2-Touch Trendline Scanner", page_icon="📈", layout="wide")
 st.title("📈 NSE 2-Touch Descending Trendline Breakout Scanner")
@@ -24,6 +24,12 @@ with st.sidebar:
     require_volume = st.checkbox("Require breakout volume above 20-day average", value=True)
     min_price = st.number_input("Minimum stock price (₹)", min_value=0.0, value=20.0, step=5.0)
     symbols_text = st.text_area("Optional symbols (comma-separated; leave blank for all EQ stocks)", placeholder="RELIANCE, TCS, INFY")
+    data_source = st.radio("Market data", ["Upload NSE bhavcopy files", "Download from NSE"], index=0)
+    uploaded_files = st.file_uploader(
+        "Upload daily bhavcopy files or one ZIP containing many dates",
+        type=["csv", "zip", "xlsx"], accept_multiple_files=True,
+        help="A ZIP may contain many daily CSVs or daily bhavcopy ZIP files. You can also select files for multiple dates.",
+    ) if data_source == "Upload NSE bhavcopy files" else []
     run_scan = st.button("🚀 Run NSE Scan", type="primary", use_container_width=True)
 
 st.info("The scanner defines a touch as a confirmed swing high within the selected ATR tolerance of the line. 'Exactly two' means exactly two qualifying confirmed swing highs on that candidate line. This is a reproducible algorithmic definition, not a guarantee that every charting method draws the same line.")
@@ -42,8 +48,20 @@ if run_scan:
         st.error("Maximum gap must be greater than minimum gap.")
         st.stop()
     try:
-        with st.spinner("Downloading official NSE daily bhavcopy history. First run may take several minutes…"):
-            data = load_nse_data(int(months))
+        if data_source == "Upload NSE bhavcopy files":
+            if not uploaded_files:
+                st.error("Upload several daily bhavcopy files first. Use the NSE All Reports page linked below.")
+                st.stop()
+            with st.spinner(f"Reading {len(uploaded_files)} uploaded file(s) and combining their dates…"):
+                frames = [read_uploaded_history(f.getvalue(), f.name) for f in uploaded_files]
+                data = pd.concat(frames, ignore_index=True).drop_duplicates(["DATE", "SYMBOL"], keep="last")
+                data = data.sort_values(["SYMBOL", "DATE"])
+            if data.empty:
+                st.error("The uploaded files contain no usable EQ-series rows. Check the columns and date range.")
+                st.stop()
+        else:
+            with st.spinner("Downloading official NSE daily bhavcopy history. First run may take several minutes…"):
+                data = load_nse_data(int(months))
         if data.empty:
             st.warning("No NSE data was returned. Try again later or upload/check the data source.")
             st.stop()
@@ -75,7 +93,7 @@ if run_scan:
         st.session_state["scan_args"] = args
     except Exception as exc:
         st.error(f"Scan failed: {exc}")
-        st.caption("NSE may temporarily block automated archive downloads. Try again later. You can also run the same scanner locally from the GitHub repository.")
+        st.caption("Try uploading NSE daily bhavcopy files to bypass automated archive downloads.")
 
 if "scan_results" in st.session_state:
     results = st.session_state["scan_results"]
@@ -116,6 +134,8 @@ with st.expander("How the scanner works / limitations"):
 
     **Important:** NSE bhavcopy history is not adjusted for every corporate action. Delisted/newly listed stocks and temporary NSE download restrictions can affect coverage. This is a technical screening tool, not investment advice. Always inspect each chart and manage risk independently.
     """)
+
+st.markdown("**Download data:** [NSE All Reports](https://www.nseindia.com/all-reports) → search for **CM-UDiFF Common Bhavcopy Final (zip)**. Download daily files for the dates you need, then upload several dates above. NSE's [Historical Reports](https://www.nseindia.com/static/resources/historical-reports-capital-market-daily-monthly-archives) page also links to daily and monthly archives. The scanner needs a history of daily OHLCV rows; one day's file cannot establish two touches.")
 
 st.divider()
 st.caption("Data source: NSE official CM daily bhavcopy archive. The app scans the latest available completed session; it does not predict future breakouts.")
