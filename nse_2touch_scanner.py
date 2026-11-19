@@ -253,16 +253,23 @@ def evaluate_symbol(g: pd.DataFrame, args) -> Optional[dict]:
             vol_ok = pd.notna(vol_avg) and float(g.loc[last,"VOLUME"]) > float(vol_avg)
             if args.require_volume and not vol_ok: continue
             breakout_pct = (close/line_now-1)*100 if line_now else 0
+            stop_loss = min(float(g.loc[last,"LOW"]), line_now-float(g.loc[last,"ATR14"]))
+            risk_per_share = close - stop_loss
+            if risk_per_share <= 0: continue
+            reward_risk = float(getattr(args, "reward_risk", 2.0))
             candidates.append({
                 "Symbol": g.loc[last,"SYMBOL"], "Breakout Date": g.loc[last,"DATE"].date(),
                 "Close": round(close,2), "Trendline at Close": round(line_now,2),
                 "Breakout %": round(breakout_pct,2), "Touch 1 Date": g.loc[i,"DATE"].date(),
                 "Touch 1 High": round(h1,2), "Touch 2 Date": g.loc[j,"DATE"].date(),
+                "Touch 2 Confirmed Date": g.loc[j+args.right,"DATE"].date(),
+                "Bars After Touch 2": last-j,
                 "Touch 2 High": round(h2,2), "Touch Count": len(touches),
                 "Volume": int(g.loc[last,"VOLUME"]), "20D Avg Volume": int(vol_avg) if pd.notna(vol_avg) else None,
                 "Volume Confirmed": "YES" if vol_ok else "NO",
                 "ATR14": round(float(g.loc[last,"ATR14"]),2),
-                "Technical SL Reference": round(min(float(g.loc[last,"LOW"]), line_now-float(g.loc[last,"ATR14"])),2),
+                "Stop Loss": round(stop_loss,2),
+                f"Target ({reward_risk:g}R)": round(close + reward_risk*risk_per_share,2),
                 "Pivot High 1 Index": i, "Pivot High 2 Index": j
             })
     if not candidates: return None
@@ -270,16 +277,105 @@ def evaluate_symbol(g: pd.DataFrame, args) -> Optional[dict]:
     return sorted(candidates, key=lambda x: (x["Touch 2 Date"], x["Breakout %"]), reverse=True)[0]
 
 
-def save_excel(results: pd.DataFrame, data: pd.DataFrame, filename: Path):
+def backtest_symbol(g: pd.DataFrame, args, reward_risk: float = 2.0, max_holding_bars: int = 20,
+                    min_price: float = 0.0) -> list[dict]:
+    """Backtest close-confirmed signals with next-open entries and conservative daily OHLC exits."""
+    g = g.sort_values("DATE").reset_index(drop=True)
+    if len(g) < max(46, args.left + args.right + 21):
+        return []
+    trades = []
+    next_entry_allowed = 0
+    for signal_idx in range(max(44, args.left + args.right + 20), len(g)-max_holding_bars):
+        if signal_idx < next_entry_allowed:
+            continue
+        signal = evaluate_symbol(g.iloc[:signal_idx+1], args)
+        if not signal or signal["Close"] < min_price:
+            continue
+        entry_idx = signal_idx + 1
+        entry = float(g.loc[entry_idx, "OPEN"])
+        stop = float(signal["Stop Loss"])
+        risk = entry - stop
+        if risk <= 0:
+            continue  # A gap below the structural stop invalidates the entry.
+        target = entry + reward_risk * risk
+        final_idx = min(len(g)-1, entry_idx + max_holding_bars - 1)
+        exit_idx = final_idx
+        exit_price = float(g.loc[final_idx, "CLOSE"])
+        reason = "Time exit"
+        for idx in range(entry_idx, final_idx+1):
+            opn = float(g.loc[idx, "OPEN"])
+            low = float(g.loc[idx, "LOW"])
+            high = float(g.loc[idx, "HIGH"])
+            if opn <= stop:
+                exit_idx, exit_price, reason = idx, opn, "Gap below stop"
+                break
+            if opn >= target:
+                exit_idx, exit_price, reason = idx, target, "Target"
+                break
+            # If both levels are touched in one daily bar, assume the stop was hit first.
+            if low <= stop:
+                exit_idx, exit_price, reason = idx, stop, "Stop loss"
+                break
+            if high >= target:
+                exit_idx, exit_price, reason = idx, target, "Target"
+                break
+        pnl = exit_price - entry
+        trades.append({
+            "Symbol": signal["Symbol"], "Signal Date": signal["Breakout Date"],
+            "Touch 2 Date": signal["Touch 2 Date"], "Touch 2 Confirmed Date": signal["Touch 2 Confirmed Date"],
+            "Bars After Touch 2": signal["Bars After Touch 2"],
+            "Entry Date": g.loc[entry_idx,"DATE"].date(), "Entry Price": round(entry,2),
+            "Stop Loss": round(stop,2), "Target": round(target,2),
+            "Exit Date": g.loc[exit_idx,"DATE"].date(), "Exit Price": round(exit_price,2),
+            "Exit Reason": reason, "Holding Sessions": exit_idx-entry_idx+1,
+            "Return %": round(pnl/entry*100,2), "R Multiple": round(pnl/risk,2),
+        })
+        next_entry_allowed = exit_idx + 1
+    return trades
+
+
+def summarize_backtest(trades: pd.DataFrame, reward_risk: float, max_holding_bars: int) -> pd.DataFrame:
+    if trades.empty:
+        return pd.DataFrame([{"Metric": "Completed trades", "Value": 0},
+            {"Metric": "Rules", "Value": f"Next-session open entry; {reward_risk:g}R target; structural stop; {max_holding_bars}-session time exit"}])
+    returns = pd.to_numeric(trades["Return %"], errors="coerce").fillna(0)
+    r_values = pd.to_numeric(trades["R Multiple"], errors="coerce").fillna(0)
+    gross_r_loss = abs(float(r_values[r_values < 0].sum()))
+    values = [
+        ("Completed trades", len(trades)),
+        ("Win rate %", round(float((returns > 0).mean()*100),2)),
+        ("Average return per trade %", round(float(returns.mean()),2)),
+        ("Median return per trade %", round(float(returns.median()),2)),
+        ("Average R multiple (expectancy)", round(float(r_values.mean()),2)),
+        ("Net R across trades", round(float(r_values.sum()),2)),
+        ("Profit factor (R)", round(float(r_values[r_values > 0].sum()/gross_r_loss),2) if gross_r_loss else "N/A"),
+        ("Backtest signal period", f"{trades['Signal Date'].min()} to {trades['Signal Date'].max()}"),
+        ("Target exits", int((trades["Exit Reason"] == "Target").sum())),
+        ("Stop exits", int(trades["Exit Reason"].isin(["Stop loss", "Gap below stop"]).sum())),
+        ("Time exits", int((trades["Exit Reason"] == "Time exit").sum())),
+        ("Rules", f"Next-session open entry; {reward_risk:g}R target; structural stop; {max_holding_bars}-session time exit"),
+        ("Limitations", "Current Nifty 200 membership applied to history; no fees/slippage; same-day stop assumed first if both levels touched; unfinished holding windows excluded."),
+    ]
+    return pd.DataFrame(values, columns=["Metric", "Value"])
+
+
+def save_excel(results: pd.DataFrame, data: pd.DataFrame, filename: Path,
+               backtest_trades: Optional[pd.DataFrame] = None,
+               backtest_summary: Optional[pd.DataFrame] = None):
     filename.parent.mkdir(parents=True, exist_ok=True)
     with pd.ExcelWriter(filename, engine="openpyxl") as writer:
         results.to_excel(writer, sheet_name="Fresh Breakouts", index=False)
-        meta = pd.DataFrame({"Item": ["Data source", "Universe", "Signal definition", "Touch definition", "Breakout definition", "Important limitation"],
-            "Value": ["NSE CM UDiFF Common Bhavcopy Final (official daily files)", "NSE cash EQ series; SME/non-EQ series excluded",
+        meta = pd.DataFrame({"Item": ["Data source", "Universe", "Signal definition", "Touch definition", "Breakout definition", "Stop / target", "Important limitation"],
+            "Value": ["NSE CM UDiFF Common Bhavcopy Final (official daily files)", "Current Nifty 200 constituents; NSE cash EQ series",
             "Latest completed daily candle only", "Exactly two confirmed swing highs within configured ATR tolerance, including the two anchor highs",
             "Previous close at/below projected line and latest close above projected line",
+            "Stop: lower of breakout-day low and projected line minus ATR(14); target: configured R multiple (default 2R)",
             "Geometric rule is explicit but remains a technical pattern definition, not a guarantee; corporate-action gaps can affect unadjusted bhavcopy history."]})
         meta.to_excel(writer, sheet_name="Methodology", index=False)
+        if backtest_summary is not None:
+            backtest_summary.to_excel(writer, sheet_name="Backtest Summary", index=False)
+        if backtest_trades is not None:
+            backtest_trades.to_excel(writer, sheet_name="Backtest Trades", index=False)
         for ws in writer.book.worksheets:
             ws.freeze_panes = "A2"; ws.auto_filter.ref = ws.dimensions
             for cell in ws[1]:
