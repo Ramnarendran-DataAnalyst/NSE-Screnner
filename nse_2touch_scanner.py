@@ -19,6 +19,7 @@ BASE = Path(__file__).resolve().parent
 CACHE = BASE / "data" / "bhavcopy"
 OUT = BASE / "output"
 URL = "https://nsearchives.nseindia.com/content/cm/BhavCopy_NSE_CM_0_0_0_{ymd}_F_0000.csv.zip"
+NIFTY200_URL = "https://nsearchives.nseindia.com/content/indices/ind_nifty200list.csv"
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
     "Accept": "*/*", "Accept-Language": "en-US,en;q=0.9", "Referer": "https://www.nseindia.com/"
@@ -42,6 +43,32 @@ def get_session():
     try: s.get("https://www.nseindia.com", timeout=15)
     except requests.RequestException: pass
     return s
+
+
+def get_nifty200_symbols() -> set[str]:
+    """Fetch the current Nifty 200 constituent symbols from NSE's official CSV."""
+    response = requests.get(NIFTY200_URL, headers=HEADERS, timeout=25)
+    response.raise_for_status()
+    constituents = pd.read_csv(io.BytesIO(response.content))
+    symbol_col = next((c for c in constituents.columns if re.sub(r"[^A-Z0-9]", "", str(c).upper()) in {"SYMBOL", "TCKRSYMB"}), None)
+    if symbol_col is None:
+        raise ValueError(f"NSE constituent file has no Symbol column. Headers found: {list(constituents.columns)}")
+    symbols = set(constituents[symbol_col].astype(str).str.strip().str.upper()) - {"", "NAN"}
+    if not 180 <= len(symbols) <= 220:
+        raise ValueError(f"Expected about 200 Nifty 200 constituents, found {len(symbols)}")
+    return symbols
+
+
+def read_symbol_list(content: bytes) -> set[str]:
+    """Read an NSE index constituent CSV supplied by the user."""
+    table = pd.read_csv(io.BytesIO(content))
+    symbol_col = next((c for c in table.columns if re.sub(r"[^A-Z0-9]", "", str(c).upper()) in {"SYMBOL", "TCKRSYMB"}), None)
+    if symbol_col is None:
+        raise ValueError(f"Constituent CSV needs a Symbol column. Headers found: {list(table.columns)}")
+    symbols = set(table[symbol_col].astype(str).str.strip().str.upper()) - {"", "NAN"}
+    if not 180 <= len(symbols) <= 220:
+        raise ValueError(f"This list contains {len(symbols)} symbols; expected the official Nifty 200 list (about 200)")
+    return symbols
 
 
 def read_bhavcopy(content: bytes, filename: str = "upload.csv") -> pd.DataFrame:
