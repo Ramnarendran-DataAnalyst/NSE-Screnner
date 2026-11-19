@@ -9,12 +9,12 @@ from types import SimpleNamespace
 import pandas as pd
 import streamlit as st
 
-from nse_2touch_scanner import (backtest_symbol, download_history, evaluate_symbol,
+from nse_2touch_scanner import (backtest_symbol, download_history, evaluate_recent_breakout,
     get_nifty200_symbols, read_symbol_list, read_uploaded_history, save_excel, summarize_backtest)
 
 st.set_page_config(page_title="NSE 2-Touch Trendline Scanner", page_icon="📈", layout="wide")
 st.title("📈 Nifty 200 2-Touch Descending Trendline Breakout Scanner")
-st.caption("Nifty 200 constituents only · Daily completed candles · Exactly two qualifying swing-high touches")
+st.caption("Nifty 200 constituents only · Completed daily candles · Recent close-confirmed breakouts · Exactly two qualifying swing-high touches")
 
 with st.sidebar:
     st.header("Scan settings")
@@ -29,6 +29,7 @@ with st.sidebar:
     reward_risk = st.number_input("Target risk/reward", min_value=0.5, max_value=5.0, value=2.0, step=0.5)
     max_holding_bars = st.number_input("Backtest max holding sessions", min_value=1, max_value=120, value=20, step=1)
     run_backtest = st.checkbox("Backtest earlier signals in supplied history", value=True)
+    recent_window = st.number_input("Include breakouts up to N completed sessions old", min_value=0, max_value=5, value=2, step=1)
     min_price = st.number_input("Minimum stock price (₹)", min_value=0.0, value=20.0, step=5.0)
     symbols_text = st.text_area("Optional symbols (comma-separated; leave blank for all EQ stocks)", placeholder="RELIANCE, TCS, INFY")
     data_source = st.radio("Market data", ["Upload NSE bhavcopy files", "Download from NSE"], index=0)
@@ -105,7 +106,7 @@ if run_scan:
         groups = list(data.groupby("SYMBOL", sort=False))
         for idx, (symbol, group) in enumerate(groups, start=1):
             try:
-                result = evaluate_symbol(group, args)
+                result = evaluate_recent_breakout(group, args, int(recent_window))
                 if result and result["Close"] >= float(min_price):
                     matches.append(result)
             except Exception:
@@ -146,6 +147,8 @@ if "scan_results" in st.session_state:
     c1.metric("Stocks scanned", f"{st.session_state['scan_count']:,}")
     c2.metric("Fresh breakout matches", f"{len(results):,}")
     c3.metric("Latest data date", str(st.session_state["scan_data_date"]))
+    if (pd.Timestamp.now(tz="Asia/Kolkata").date() - st.session_state["scan_data_date"]).days > 4:
+        st.warning(f"The supplied data is stale: latest session is {st.session_state['scan_data_date']}. Upload a newer bhavcopy history for current signals.")
     if results.empty:
         st.success("No stocks met all selected conditions for the latest available completed session. Filters were not relaxed automatically.")
     else:
@@ -188,10 +191,11 @@ with st.expander("How the scanner works / limitations"):
     2. Detects confirmed swing highs using the selected left/right pivot window.
     3. Tests descending lines joining pairs of swing highs.
     4. Counts qualifying swing highs within the ATR-based touch tolerance; requires exactly two, including both anchors.
-    5. Requires the previous completed close to be at/below the projected line and the latest completed close to be above it.
+    5. Requires the previous completed close to be at/below the projected line and the signal-session close to be above it. By default, signals up to 2 completed sessions old remain visible.
     6. Optionally requires latest volume above its 20-session average.
-    7. Confirms swing highs only after the configured right-side bars close (default 3). This and the daily-close/volume rules can delay a signal relative to an intraday trendline crossing. The candidate table shows bars since Touch 2.
-    8. Historical test: next-session open entry, structural stop, default 2R target, and time exit after the chosen maximum holding sessions.
+    7. This is not a real-time or intraday scanner. Uploaded data only covers its included dates; the automatic source downloads completed daily files. The latest data date is shown, and stale data triggers a warning.
+    8. Confirms swing highs only after the configured right-side bars close (default 3). This and the daily-close/volume rules can delay a signal relative to an intraday trendline crossing. The candidate table shows bars since Touch 2.
+    9. Historical test: next-session open entry, structural stop, default 2R target, and time exit after the chosen maximum holding sessions.
 
     **Important:** NSE bhavcopy history is not adjusted for every corporate action. Delisted/newly listed stocks and temporary NSE download restrictions can affect coverage. This is a technical screening tool, not investment advice. Always inspect each chart and manage risk independently.
     """)
