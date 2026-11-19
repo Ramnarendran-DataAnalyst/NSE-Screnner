@@ -277,6 +277,18 @@ def evaluate_symbol(g: pd.DataFrame, args) -> Optional[dict]:
     return sorted(candidates, key=lambda x: (x["Touch 2 Date"], x["Breakout %"]), reverse=True)[0]
 
 
+def evaluate_recent_breakout(g: pd.DataFrame, args, max_age_sessions: int = 2) -> Optional[dict]:
+    """Return the newest qualifying close-confirmed breakout no more than N sessions old."""
+    g = g.sort_values("DATE").reset_index(drop=True)
+    for age in range(min(max_age_sessions + 1, len(g))):
+        cutoff = len(g) - age
+        signal = evaluate_symbol(g.iloc[:cutoff], args)
+        if signal:
+            signal["Signal Age (sessions)"] = age
+            return signal
+    return None
+
+
 def backtest_symbol(g: pd.DataFrame, args, reward_risk: float = 2.0, max_holding_bars: int = 20,
                     min_price: float = 0.0) -> list[dict]:
     """Backtest close-confirmed signals with next-open entries and conservative daily OHLC exits."""
