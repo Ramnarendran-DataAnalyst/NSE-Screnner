@@ -6,11 +6,11 @@ from types import SimpleNamespace
 import pandas as pd
 import streamlit as st
 
-from nse_2touch_scanner import download_history, evaluate_symbol, read_uploaded_history, save_excel
+from nse_2touch_scanner import download_history, evaluate_symbol, get_nifty200_symbols, read_symbol_list, read_uploaded_history, save_excel
 
 st.set_page_config(page_title="NSE 2-Touch Trendline Scanner", page_icon="📈", layout="wide")
-st.title("📈 NSE 2-Touch Descending Trendline Breakout Scanner")
-st.caption("Daily NSE cash-market scanner · Completed candles only · Exactly two qualifying swing-high touches")
+st.title("📈 Nifty 200 2-Touch Descending Trendline Breakout Scanner")
+st.caption("Nifty 200 constituents only · Daily completed candles · Exactly two qualifying swing-high touches")
 
 with st.sidebar:
     st.header("Scan settings")
@@ -30,6 +30,11 @@ with st.sidebar:
         type=["csv", "zip", "xlsx"], accept_multiple_files=True,
         help="A ZIP may contain many daily CSVs or daily bhavcopy ZIP files. You can also select files for multiple dates.",
     ) if data_source == "Upload NSE bhavcopy files" else []
+    constituents_file = st.file_uploader(
+        "Nifty 200 constituents CSV (only needed if NSE list download fails)",
+        type=["csv"], accept_multiple_files=False,
+        help="Download the official Nifty 200 stock list from NSE's index page.",
+    )
     run_scan = st.button("🚀 Run NSE Scan", type="primary", use_container_width=True)
 
 st.info("The scanner defines a touch as a confirmed swing high within the selected ATR tolerance of the line. 'Exactly two' means exactly two qualifying confirmed swing highs on that candidate line. This is a reproducible algorithmic definition, not a guarantee that every charting method draws the same line.")
@@ -38,6 +43,10 @@ st.info("The scanner defines a touch as a confirmed swing high within the select
 def load_nse_data(month_count: int):
     # Streamlit Cloud has ephemeral local storage; this cache avoids repeat downloads during its TTL.
     return download_history(month_count, pause=0.25)
+
+@st.cache_data(show_spinner=False, ttl=6 * 60 * 60)
+def load_nifty200():
+    return get_nifty200_symbols()
 
 if run_scan:
     args = SimpleNamespace(
@@ -48,6 +57,12 @@ if run_scan:
         st.error("Maximum gap must be greater than minimum gap.")
         st.stop()
     try:
+        try:
+            nifty200_symbols = read_symbol_list(constituents_file.getvalue()) if constituents_file else load_nifty200()
+        except Exception as exc:
+            st.error(f"Could not load the official Nifty 200 list: {exc}")
+            st.info("Download **List of Nifty 200 Stocks (.csv)** from the official NSE Nifty 200 page and upload it in the sidebar.")
+            st.stop()
         if data_source == "Upload NSE bhavcopy files":
             if not uploaded_files:
                 st.error("Upload several daily bhavcopy files first. Use the NSE All Reports page linked below.")
@@ -65,6 +80,12 @@ if run_scan:
         if data.empty:
             st.warning("No NSE data was returned. Try again later or upload/check the data source.")
             st.stop()
+        before_filter = data["SYMBOL"].nunique()
+        data = data[data["SYMBOL"].isin(nifty200_symbols)].copy()
+        if data.empty:
+            st.error("None of the uploaded/downloaded symbols matched the current Nifty 200 list. Check that you uploaded NSE CM EQ-series bhavcopies and the official constituent CSV.")
+            st.stop()
+        st.caption(f"Universe filter: Nifty 200 only · {data['SYMBOL'].nunique()} constituents found in the supplied history (of {len(nifty200_symbols)} current constituents).")
         requested = [x.strip().upper() for x in symbols_text.split(",") if x.strip()]
         if requested:
             missing = sorted(set(requested) - set(data["SYMBOL"].unique()))
