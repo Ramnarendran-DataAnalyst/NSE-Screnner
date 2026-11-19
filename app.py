@@ -1,12 +1,16 @@
 from __future__ import annotations
 import io
+import os
+import tempfile
 from datetime import datetime
+from pathlib import Path
 from types import SimpleNamespace
 
 import pandas as pd
 import streamlit as st
 
-from nse_2touch_scanner import download_history, evaluate_symbol, get_nifty200_symbols, read_symbol_list, read_uploaded_history, save_excel
+from nse_2touch_scanner import (backtest_symbol, download_history, evaluate_symbol,
+    get_nifty200_symbols, read_symbol_list, read_uploaded_history, save_excel, summarize_backtest)
 
 st.set_page_config(page_title="NSE 2-Touch Trendline Scanner", page_icon="📈", layout="wide")
 st.title("📈 Nifty 200 2-Touch Descending Trendline Breakout Scanner")
@@ -22,6 +26,9 @@ with st.sidebar:
     max_gap = st.number_input("Maximum bars between touches", 10, 100, 60)
     tolerance = st.slider("Touch tolerance (ATR multiple)", 0.05, 0.50, 0.15, 0.01)
     require_volume = st.checkbox("Require breakout volume above 20-day average", value=True)
+    reward_risk = st.number_input("Target risk/reward", min_value=0.5, max_value=5.0, value=2.0, step=0.5)
+    max_holding_bars = st.number_input("Backtest max holding sessions", min_value=1, max_value=120, value=20, step=1)
+    run_backtest = st.checkbox("Backtest earlier signals in supplied history", value=True)
     min_price = st.number_input("Minimum stock price (₹)", min_value=0.0, value=20.0, step=5.0)
     symbols_text = st.text_area("Optional symbols (comma-separated; leave blank for all EQ stocks)", placeholder="RELIANCE, TCS, INFY")
     data_source = st.radio("Market data", ["Upload NSE bhavcopy files", "Download from NSE"], index=0)
@@ -51,7 +58,8 @@ def load_nifty200():
 if run_scan:
     args = SimpleNamespace(
         lookback=int(lookback), left=int(left), right=int(right), min_gap=int(min_gap),
-        max_gap=int(max_gap), tolerance_atr=float(tolerance), require_volume=bool(require_volume)
+        max_gap=int(max_gap), tolerance_atr=float(tolerance), require_volume=bool(require_volume),
+        reward_risk=float(reward_risk),
     )
     if max_gap <= min_gap:
         st.error("Maximum gap must be greater than minimum gap.")
@@ -104,6 +112,20 @@ if run_scan:
                 pass
             if idx % 10 == 0 or idx == len(groups):
                 progress.progress(idx / max(len(groups), 1), text=f"Scanned {idx:,} / {len(groups):,} symbols")
+        backtest_trades = pd.DataFrame()
+        backtest_summary = pd.DataFrame()
+        if run_backtest:
+            bt_progress = st.progress(0, text="Backtesting earlier signals…")
+            all_trades = []
+            for idx, (symbol, group) in enumerate(groups, start=1):
+                try:
+                    all_trades.extend(backtest_symbol(group, args, float(reward_risk), int(max_holding_bars), float(min_price)))
+                except Exception as exc:
+                    st.warning(f"Backtest skipped {symbol}: {exc}")
+                if idx % 10 == 0 or idx == len(groups):
+                    bt_progress.progress(idx / max(len(groups), 1), text=f"Backtested {idx:,} / {len(groups):,} symbols")
+            backtest_trades = pd.DataFrame(all_trades)
+            backtest_summary = summarize_backtest(backtest_trades, float(reward_risk), int(max_holding_bars))
         results = pd.DataFrame(matches)
         if not results.empty:
             results = results.sort_values(["Breakout %", "Volume Confirmed"], ascending=[False, False]).reset_index(drop=True)
@@ -112,6 +134,8 @@ if run_scan:
         st.session_state["scan_count"] = data["SYMBOL"].nunique()
         st.session_state["scan_rows"] = len(data)
         st.session_state["scan_args"] = args
+        st.session_state["backtest_trades"] = backtest_trades
+        st.session_state["backtest_summary"] = backtest_summary
     except Exception as exc:
         st.error(f"Scan failed: {exc}")
         st.caption("Try uploading NSE daily bhavcopy files to bypass automated archive downloads.")
@@ -129,20 +153,34 @@ if "scan_results" in st.session_state:
         st.dataframe(results.drop(columns=[c for c in results.columns if c.endswith("Index")], errors="ignore"), use_container_width=True, hide_index=True)
         csv = results.to_csv(index=False).encode("utf-8-sig")
         st.download_button("⬇️ Download CSV", csv, file_name="NSE_2Touch_Breakouts.csv", mime="text/csv")
-        xlsx_buffer = io.BytesIO()
-        temp_path = None
-        import tempfile, os
-        with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tmp:
-            temp_path = tmp.name
-        try:
-            save_excel(results, pd.DataFrame(), __import__('pathlib').Path(temp_path))
-            with open(temp_path, "rb") as f:
-                xlsx_buffer.write(f.read())
-            st.download_button("⬇️ Download Excel report", xlsx_buffer.getvalue(), file_name="NSE_2Touch_Breakouts.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-        finally:
-            if temp_path and os.path.exists(temp_path):
-                os.remove(temp_path)
-        st.caption("Breakout % is the closing price's distance above the projected trendline. Technical SL Reference is a reference for further chart review, not an order instruction.")
+        st.caption("Signal is confirmed at the daily close. Stop Loss uses the lower of the signal-day low and projected trendline minus ATR(14); target defaults to 2R. These are research levels, not order instructions.")
+
+if "backtest_summary" in st.session_state and not st.session_state["backtest_summary"].empty:
+    st.subheader("Historical backtest")
+    st.caption("Signal at daily close; entry at the next session open. Target defaults to 2R; stop is the structural signal-day stop; trades exit at stop, target, or after the holding limit. If one daily candle touches both target and stop, the backtest assumes the stop came first. Signals without a complete holding window in the supplied history are excluded.")
+    st.dataframe(st.session_state["backtest_summary"], use_container_width=True, hide_index=True)
+    historical_trades = st.session_state["backtest_trades"]
+    if not historical_trades.empty:
+        st.dataframe(historical_trades, use_container_width=True, hide_index=True)
+        st.download_button("⬇️ Download backtest trades CSV", historical_trades.to_csv(index=False).encode("utf-8-sig"), file_name="NSE_2Touch_Backtest_Trades.csv", mime="text/csv")
+
+if "scan_results" in st.session_state:
+    xlsx_buffer = io.BytesIO()
+    with tempfile.NamedTemporaryFile(suffix=".xlsx", delete=False) as tmp:
+        temp_path = tmp.name
+    try:
+        summary = st.session_state.get("backtest_summary", pd.DataFrame())
+        trades = st.session_state.get("backtest_trades", pd.DataFrame())
+        save_excel(st.session_state["scan_results"], pd.DataFrame(), Path(temp_path),
+                   trades, summary if not summary.empty else None)
+        with open(temp_path, "rb") as report:
+            xlsx_buffer.write(report.read())
+        st.download_button("⬇️ Download Excel report (signals + backtest)", xlsx_buffer.getvalue(),
+            file_name="NSE_2Touch_Screener_Report.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    finally:
+        if os.path.exists(temp_path):
+            os.remove(temp_path)
 
 with st.expander("How the scanner works / limitations"):
     st.markdown("""
@@ -152,6 +190,8 @@ with st.expander("How the scanner works / limitations"):
     4. Counts qualifying swing highs within the ATR-based touch tolerance; requires exactly two, including both anchors.
     5. Requires the previous completed close to be at/below the projected line and the latest completed close to be above it.
     6. Optionally requires latest volume above its 20-session average.
+    7. Confirms swing highs only after the configured right-side bars close (default 3). This and the daily-close/volume rules can delay a signal relative to an intraday trendline crossing. The candidate table shows bars since Touch 2.
+    8. Historical test: next-session open entry, structural stop, default 2R target, and time exit after the chosen maximum holding sessions.
 
     **Important:** NSE bhavcopy history is not adjusted for every corporate action. Delisted/newly listed stocks and temporary NSE download restrictions can affect coverage. This is a technical screening tool, not investment advice. Always inspect each chart and manage risk independently.
     """)
